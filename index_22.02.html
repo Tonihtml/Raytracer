@@ -563,7 +563,7 @@
                             // https://youtu.be/Qz0KTGYJtUk?si=NIelFnpAxqFZKysX 22:02 min.
 
                             if(closestHitInfo.didHit) {
-                                ray.color *= mix(closestHitInfo.color, vec3f(1.0), closestHitInfo.mirrorStrength);
+                                //ray.color *= mix(closestHitInfo.color, vec3f(1.0), closestHitInfo.mirrorStrength);
                                 rayOrigin = closestHitInfo.hitpoint;
 
                                 brightness += closestHitInfo.color * closestHitInfo.emissionStrength * rayColor;
@@ -862,5 +862,6 @@ init();
 </script>
 </body>
 </html>
+
 
 
