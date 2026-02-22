@@ -1,0 +1,864 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>WebGPU Gradient Compute Shader</title>
+<style>
+    body{ 
+        margin: 0; 
+        height: 100%; 
+        overflow: hidden; 
+    }
+    canvas{ 
+        width: 100%; 
+        height: 100%; 
+        display: block; 
+    }
+    #fps{
+        position: absolute;
+        top: -10px;
+        left: 7px;
+        color: lime;
+        font-family: monospace;
+        font-size: 16px;
+        background: rgba(0,0,0,0.5);
+        padding: 4px 8px;
+        border-radius: 4px;
+    }
+</style>
+</head>
+<body>
+<canvas id="gpuCanvas"></canvas>
+<p id="fps">---</p>
+<script type="module">
+
+    import * as THREE from 'three';
+    import { GLTFLoader } from './node_modules/three/examples/jsm/loaders/GLTFLoader.js';
+
+    async function init() {
+        if (!navigator.gpu) {
+            alert("WebGPU not supported!");
+            return;
+        }
+
+
+        const canvas = document.getElementById("gpuCanvas");
+        canvas.width = window.innerWidth * 1;
+        canvas.height = window.innerHeight * 1;
+        const adapter = await navigator.gpu.requestAdapter();
+        const device = await adapter.requestDevice({requiredLimits: {maxBufferSize: adapter.limits.maxBufferSize}});
+        const context = canvas.getContext("webgpu");
+        const format = navigator.gpu.getPreferredCanvasFormat();
+        context.configure({
+            device: device,
+            format: format,
+            alphaMode: "opaque",
+        });
+
+
+
+        function packCameraData(cam) {
+            return new Float32Array([
+                cam.position[0], cam.position[1], cam.position[2], 0.0,
+                cam.rotation[0], cam.rotation[1], cam.rotation[2], 0.0,
+                cam.fov, cam.aspect, cam.near, cam.far
+            ]);
+        };
+
+        function addMeshToScene(mesh, pos, rot, emissionStrength, mirrorStrength, mirrorFade) {
+            mesh.position.set(pos[0], pos[1], pos[2]);
+            mesh.rotation.set(rot[0], rot[1], rot[2]);
+
+            if(!mesh.isMesh) {
+                throw new Error("addMeshToScene expects a THREE.Mesh")
+            };
+
+            mesh.updateMatrixWorld(true)
+
+            let geometry = mesh.geometry.clone()
+
+            geometry.applyMatrix4(mesh.matrixWorld)
+
+            if (geometry.index) {
+                geometry = geometry.toNonIndexed()
+            }
+
+            const position = geometry.attributes.position.array
+
+            const startVertex = vertices.length
+
+            for (let i = 0; i < position.length; i++) {
+                vertices.push(position[i])
+            }
+
+            const endVertex = vertices.length
+
+            geometry.computeBoundingBox()
+            const bb = geometry.boundingBox
+
+            const mat = mesh.material
+            const color = mat.color ?? new THREE.Color(1, 1, 1);
+
+            objects.push(
+                bb.min.x, 
+                bb.min.y, 
+                bb.min.z,
+                bb.max.x, 
+                bb.max.y, 
+                bb.max.z,
+                startVertex, 
+                endVertex,
+                color.r, 
+                color.g, 
+                color.b, 
+                mirrorStrength,
+                emissionStrength,
+                mirrorFade
+            );
+        };
+
+        const loader = new GLTFLoader();
+        function loadGLBandAddToScene(url, pos, rot, emissionStrength, mirrorStrength, mirrorFade, extraColor = false) {
+            loader.load(url, (gltf) => {
+                const scene = gltf.scene;
+
+                scene.traverse((child) => {
+                    if(child.isMesh) {
+                        if(!extraColor) addMeshToScene(new THREE.Mesh(child.geometry, child.material), pos, rot, emissionStrength, mirrorStrength, mirrorFade);
+                        else addMeshToScene(new THREE.Mesh(child.geometry, new THREE.MeshStandardMaterial({ color: extraColor })), pos, rot, emissionStrength, mirrorStrength, mirrorFade);
+                    }
+                });
+            });
+        };
+
+
+        let minFrameTime = 250;
+        const maximumAccumulation = 2000;
+        let rdval = 1.0;
+        const Movement = {Keys: {w: false, a: false, s: false, d: false}, pointerLocked: false, mouseSettings: {sensitivity: 0.2, invertY: false}};
+        let cameraSpeed = 0.05;
+        let Pointerlocked = false;
+
+        let pixelColors = new Float32Array(canvas.width * canvas.height * 4);
+
+        const camera = {
+            position: [-4, 1.5, -4],              
+            rotation: [0.1, 0.77*3.05, 0],
+            fov: 70 * Math.PI / 180,
+            aspect: canvas.width / canvas.height,
+            near: 0.01,
+            far: 100.0
+        };
+
+        let vertices = [];
+        let objects = [];
+
+        addMeshToScene(new THREE.Mesh(new THREE.PlaneGeometry(1000, 1000), new THREE.MeshStandardMaterial({ color: "grey" })), [0, -0.0001, 0], [-Math.PI/2, 0, 0], 0.0, 0.0, 0.0);
+
+        addMeshToScene(new THREE.Mesh(new THREE.PlaneGeometry(10, 10), new THREE.MeshStandardMaterial({ color: "grey" })), [0, 0, 0], [-Math.PI/2, 0, 0], 0.0, 0.0, 0.0);
+        addMeshToScene(new THREE.Mesh(new THREE.PlaneGeometry(10, 10), new THREE.MeshStandardMaterial({ color: "grey" })), [0, 5, 0], [-Math.PI/2, 0, 0], 0.0, 0.0, 0.0);
+        //addMeshToScene(new THREE.Mesh(new THREE.PlaneGeometry(10, 5), new THREE.MeshStandardMaterial({ color: "grey" })), [0, 2.5, 5], [0, Math.PI, 0], 0.0, 0.0, 0.0);
+        addMeshToScene(new THREE.Mesh(new THREE.PlaneGeometry(10, 5), new THREE.MeshStandardMaterial({ color: "red" })), [0, 2.5, -5], [0, Math.PI, 0], 0.0, 0.0, 0.0);
+        //addMeshToScene(new THREE.Mesh(new THREE.PlaneGeometry(10, 5), new THREE.MeshStandardMaterial({ color: "grey" })), [5, 2.5, 0], [0, Math.PI/2, 0], 0.0, 0.0, 0.0);
+        addMeshToScene(new THREE.Mesh(new THREE.PlaneGeometry(10, 5), new THREE.MeshStandardMaterial({ color: "green" })), [-5, 2.5, 0], [0, -Math.PI/2, 0], 0.0, 0.0, 0.0);
+
+        //addMeshToScene(new THREE.Mesh(new THREE.PlaneGeometry(1000, 1000), new THREE.MeshStandardMaterial({ color: "white" })), [-200, 200, -200], [-Math.PI/1.5, Math.PI, 0], 1.5, 0.0, 0.0); // emission, mirror, fade
+        addMeshToScene(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.MeshStandardMaterial({ color: "white" })), [0, 4.99, 0], [-Math.PI/2, 0, 0], 10, 0.0, 0.0);
+        //addMeshToScene(new THREE.Mesh(new THREE.IcosahedronGeometry(1, 0), new THREE.MeshStandardMaterial({ color: "red" })), [3, 3, 2], [0, 0, 0], 0.0, 0.0, 0.0);
+
+        //for(let i = 1; i < 14; i++) {
+        //    loadGLBandAddToScene(`./gym/column${i}.glb`, [0, 0, 0], [0, 0, 0], 0, 0, 0);
+        //};
+        //for(let i = 1; i < 5; i++) {
+        //    loadGLBandAddToScene(`./gym/buildingPart${i}.glb`, [0, 0, 0], [0, 0, 0], 0, 0, 0);
+        //};
+
+        loadGLBandAddToScene("./knight.glb", [0, 0, 0], [0, 0, 0], 0, 0, 0, "grey");
+
+      
+        setTimeout(() => {
+
+            vertices = new Float32Array(vertices);
+            objects = new Float32Array(objects);
+
+            window.addEventListener("keydown", e => {
+                let k = e.key.toLowerCase();
+                Movement.Keys[k] = true;
+            });
+
+            window.addEventListener("keyup", e => {
+                let k = e.key.toLowerCase();
+                Movement.Keys[k] = false;
+                if(k == "p") {
+                    if(minFrameTime == 250) {
+                        minFrameTime = 16;
+                    }else {
+                        minFrameTime = 250;
+                    }
+                }
+            });
+
+            document.addEventListener("click", () => {
+                if(!Movement.pointerLocked) document.body.requestPointerLock?.();
+            });
+
+            document.addEventListener("pointerlockchange", () => {
+                Movement.pointerLocked = (document.pointerLockElement === document.body);
+            });
+
+            // Help from CHATGPT
+            document.addEventListener("mousemove", e => {
+                if(!Movement.pointerLocked) return;
+
+                const sensitivity = Movement.mouseSettings.sensitivity;
+
+                // update yaw and pitch in radians directly
+                camera.rotation[1] -= -e.movementX * sensitivity * (Math.PI / 180); // yaw
+                camera.rotation[0] -= e.movementY * sensitivity * (Movement.mouseSettings.invertY ? 1 : -1) * (Math.PI / 180); // pitch
+
+                // clamp pitch between -85 and +85 degrees in radians
+                const maxPitch = 85 * Math.PI / 180;
+                if(camera.rotation[0] > maxPitch) camera.rotation[0] = maxPitch;
+                if(camera.rotation[0] < -maxPitch) camera.rotation[0] = -maxPitch;
+
+                // normalize yaw to -PI..PI
+                camera.rotation[1] = ((camera.rotation[1] + Math.PI) % (2 * Math.PI)) - Math.PI;
+
+                frameIndex = 0;
+            });
+
+            window.addEventListener("wheel", (event) => {
+                const factor = cameraSpeed / 0.05;
+                const delta = 0.002 * factor;
+
+                if (event.deltaY > 0) {
+                    cameraSpeed -= delta;
+                } else {
+                    cameraSpeed += delta;
+                }
+
+                cameraSpeed = Math.max(0.0000001, cameraSpeed);
+            });
+
+            function movement() {
+                // help from CHATGPT until line 265
+                // setting up matrices for the camera
+
+                const yaw = camera.rotation[1];   // horizontal rotation
+                const pitch = camera.rotation[0]; // vertical rotation
+
+                const cy = Math.cos(yaw), sy = Math.sin(yaw);
+                const cp = Math.cos(pitch), sp = Math.sin(pitch);
+
+                // forward vector as array
+                const forward = [
+                    sy * cp,
+                    -sp,
+                    -cy * cp
+                ];
+
+                // right vector as array
+                const right = [
+                    cy,
+                    0,
+                    sy
+                ];
+
+                if(Movement.Keys.w) {
+                    camera.position[0] += forward[0] * cameraSpeed;
+                    camera.position[1] += forward[1] * cameraSpeed;
+                    camera.position[2] += forward[2] * cameraSpeed;
+                    frameIndex = 0;
+                }
+                if(Movement.Keys.s) {
+                    camera.position[0] -= forward[0] * cameraSpeed;
+                    camera.position[1] -= forward[1] * cameraSpeed;
+                    camera.position[2] -= forward[2] * cameraSpeed;
+                    frameIndex = 0;
+                }
+                if(Movement.Keys.a) {
+                    camera.position[0] -= right[0] * cameraSpeed;
+                    camera.position[1] -= right[1] * cameraSpeed;
+                    camera.position[2] -= right[2] * cameraSpeed;
+                    frameIndex = 0;
+                }
+                if(Movement.Keys.d) {
+                    camera.position[0] += right[0] * cameraSpeed;
+                    camera.position[1] += right[1] * cameraSpeed;
+                    camera.position[2] += right[2] * cameraSpeed;
+                    frameIndex = 0;
+                }
+            };
+
+
+
+            const computeShaderCode = `
+                //////////////////////////////////////////////////////////////////////////////////////////
+                // STRUCT CREATION
+                //////////////////////////////////////////////////////////////////////////////////////////
+
+                struct Uniforms {
+                    resolution : vec2f,
+                };
+
+                struct Camera {
+                    camPos : vec4f,
+                    camRot : vec4f, 
+                    projParams : vec4f,  // fov, aspect, near, far
+                };
+
+                struct Ray {
+                    origin : vec3f,
+                    dir : vec3f,
+                    color : vec3f,
+                    stepstaken: u32,
+                    didHit: bool
+                };
+
+                struct HitInfo {
+                    didHit: bool,
+                    distance: f32,
+                    hitpoint: vec3f,
+                    normal: vec3f,
+                    color: vec3f,
+                    emissionStrength: f32,
+                    mirrorStrength: f32,
+                    mirrorFade: f32
+                };
+
+                //////////////////////////////////////////////////////////////////////////////////////////
+                // ADD BINDING GROUPS
+                //////////////////////////////////////////////////////////////////////////////////////////
+
+                @group(0) @binding(0) var accumWrite : texture_storage_2d<rgba32float, write>;
+                @group(0) @binding(1) var accumRead  : texture_2d<f32>;
+                @group(0) @binding(2) var<uniform> u : Uniforms;
+                @group(0) @binding(3) var<uniform> camera : Camera;
+                @group(0) @binding(4) var<uniform> frameIndex : u32;
+                @group(0) @binding(5) var<uniform> rdval : f32;
+
+                @group(0) @binding(6) var<storage> meshVertices : array<f32>;
+                @group(0) @binding(7) var<storage> meshObjects : array<f32>;
+                @group(0) @binding(8) var<uniform> meshObjectslength : u32;
+            
+
+                //////////////////////////////////////////////////////////////////////////////////////////
+                // GET "RANDOM" DIRECTION IN HEMISPHERE HALF SPHERE
+                // HELP FROM CHATGPT FOR MATRIX MATH
+                // https://youtu.be/Qz0KTGYJtUk?si=_YKhxNoCVYUNwtQd 12:52 min.
+                //////////////////////////////////////////////////////////////////////////////////////////
+
+                fn cosineHemisphere(normal: vec3f, seed: f32) -> vec3f {
+                    let u1 = fract(sin(seed * 12.9898) * 43758.5453);
+                    let u2 = fract(sin((seed + 1.0) * 78.233) * 43758.5453);
+
+                    let r = sqrt(u1);
+                    let theta = 6.28318530718 * u2;
+
+                    let x = r * cos(theta);
+                    let y = r * sin(theta);
+                    let z = sqrt(1.0 - u1);
+
+                    let up = select(
+                        vec3f(0.0, 1.0, 0.0),
+                        vec3f(1.0, 0.0, 0.0),
+                        abs(normal.y) > 0.999
+                    );
+
+                    let tangent   = normalize(cross(up, normal));
+                    let bitangent = cross(normal, tangent);
+
+                    return normalize(x * tangent + y * bitangent + z * normal);
+                }
+
+
+                //////////////////////////////////////////////////////////////////////////////////////////
+                // ROTATION MATRIX TO MAKE CAMERA BEHAVE ACCORDING TO TEH INPUTS
+                // HELP FROM CHATGPT FOR MATRIX MATH
+                //////////////////////////////////////////////////////////////////////////////////////////
+
+                fn getRotationMatrix(pitch: f32, yaw: f32) -> mat3x3<f32> {                         // take yaw and pitch as 32bit float and make a 3x3 32bit float matrix wich gets filled 2 thirds
+                    let cy = cos(yaw);
+                    let sy = sin(yaw);
+                    let cp = cos(pitch);
+                    let sp = sin(pitch);
+
+                    let forward = vec3f(sy*cp, -sp, -cy*cp);
+                    let right   = vec3f(cy, 0.0, sy);
+                    let up      = cross(forward, right);                                            // all 90° to each other
+
+                    return mat3x3<f32>(
+                        right, up, forward
+                    );
+                };
+
+
+                //////////////////////////////////////////////////////////////////////////////////////////
+                // HITBOX-CHECK 
+                // HELP FROM CHATGPT
+                //////////////////////////////////////////////////////////////////////////////////////////
+
+                fn RayAABBIntersect(ray: Ray, minPos: vec3f, maxPos: vec3f) -> bool {
+                    let invDir = vec3f(1.0) / ray.dir;            // compute inverse ray direction
+                    let t0s = (minPos - ray.origin) * invDir;     // distance to near plane for each axis
+                    let t1s = (maxPos - ray.origin) * invDir;     // distance to far plane for each axis
+                    let tsmaller = min(t0s, t1s);                // smaller t for each axis
+                    let tbigger  = max(t0s, t1s);                // larger t for each axis
+                    let tmin = max(max(tsmaller.x, tsmaller.y), tsmaller.z); // largest entry t
+                    let tmax = min(min(tbigger.x, tbigger.y), tbigger.z);     // smallest exit t
+                    return tmax >= max(tmin, 0.0);               // intersect if entry before exit and in front of ray
+                };
+
+                //////////////////////////////////////////////////////////////////////////////////////////
+                // TRIANGLE-INTERSECTION TEST
+                // https://en.wikipedia.org/wiki/M%C3%B6ller%E2%80%93Trumbore_intersection_algorithm?utm_source=chatgpt.com Java implementation 
+                // https://www.scratchapixel.com/lessons/3d-basic-rendering/ray-tracing-rendering-a-triangle/moller-trumbore-ray-triangle-intersection.html?utm_source=chatgpt.com
+                //////////////////////////////////////////////////////////////////////////////////////////
+                
+                fn RayTriangleIntersect(ray: Ray, v0: vec3f, v1: vec3f, v2: vec3f, color: vec3f, mirrorStrength: f32, emissionStrength: f32, mirrorFade: f32) -> HitInfo {
+                    var hitInfo : HitInfo = HitInfo(false, 1e30, vec3f(0.0), vec3f(0.0), vec3f(0.0), 0.0, 0.0, 0.0);
+
+                    let det_epsilon = 1e-6;
+                    let thit_epsilon = 1e-4;
+                                    
+                    let e1 = v1 - v0;                                                       // Triangle edges
+                    let e2 = v2 - v0;
+
+                    let p = cross(ray.dir, e2);                                             // Begin Möller Trumbore
+                    let det = dot(e1, p);
+
+                    
+                    if abs(det) >= det_epsilon {                                                // If determinant is near zero, ray is parallel to triangle
+                        
+                        let inv_det = 1.0 / det;
+                        let t = ray.origin - v0;                                            // Vector from v0 to ray origin
+                        let u = dot(t, p) * inv_det;                                        // Compute barycentric coordinate u
+                        
+                        if u >= 0.0 && u <= 1.0 {
+
+                            let q = cross(t, e1);
+                            let v = dot(ray.dir, q) * inv_det;                              // Compute barycentric coordinate v
+                                                        
+                            if v >= 0.0 && u + v <= 1.0 {
+                                
+                                let thit = dot(e2, q) * inv_det;                            // Compute distance along the ray
+
+                                if thit > thit_epsilon {
+                                    let hitPos = ray.origin + ray.dir * thit;
+                                    var normal = normalize(cross(e1, e2));
+                                    if(dot(ray.dir, normal) > 0.0) {
+                                        normal = -normal;
+                                    };
+                                    
+                                    hitInfo.didHit = true;
+                                    hitInfo.distance = thit;
+                                    hitInfo.hitpoint = hitPos;
+                                    hitInfo.normal = normal;
+                                    hitInfo.color = color;
+                                    hitInfo.mirrorStrength = mirrorStrength;
+                                    hitInfo.emissionStrength = emissionStrength;
+                                    hitInfo.mirrorFade = mirrorFade;
+                                }
+                            }
+                        }
+                    }
+
+                    return hitInfo;
+                };
+
+
+                //////////////////////////////////////////////////////////////////////////////////////////
+                // MAIN CODE
+                //////////////////////////////////////////////////////////////////////////////////////////
+
+                @compute @workgroup_size(8,8) fn main(@builtin(global_invocation_id) pos : vec3<u32>) {
+
+                    let dims = textureDimensions(accumWrite);
+                    if (pos.x >= dims.x || pos.y >= dims.y) { return; }
+
+                    let uv = vec2f(pos.xy) / u.resolution;                                              // Convert pixel position to normalized coordinates [0,1] by dividing by screen resolution
+                    let ndc = vec2f(uv * 2.0 - 1.0);                                                    // Map [0,1] UV to Normalized Device Coordinates [-1,1] for both axes
+
+                    let fov = camera.projParams.x;                                                      // Extract vertical field of view (in radians) from camera projection parameters
+                    let aspect = camera.projParams.y;                                                   // Extract aspect ratio (width/height) from camera projection parameters
+                    let tanFov = tan(fov * 0.5);                                                        // Compute tangent of half the FOV for perspective projection scaling
+
+                    let rotation = getRotationMatrix(camera.camRot.x, camera.camRot.y);                 // Create a 3x3 rotation matrix from camera pitch (X) and yaw (Y)
+
+                    let forward = rotation * vec3f(0.0, 0.0, -1.0);                                     // Compute camera's forward direction in world space by rotating -Z unit vector
+                    let right   = rotation * vec3f(1.0, 0.0, 0.0);                                      // Compute camera's right direction in world space by rotating +X unit vector
+                    let up      = rotation * vec3f(0.0, 1.0, 0.0);                                      // Compute camera's up direction in world space by rotating +Y unit vector
+
+                    let rayDirection = normalize(                                                       // Compute final ray direction from camera through current pixel
+                        ndc.x * aspect * tanFov * right +                                               // Scale right vector by NDC X coordinate, aspect ratio, and FOV
+                        ndc.y * tanFov * up -                                                           // Scale up vector by NDC Y coordinate and FOV
+                        forward                                                                         // Subtract forward vector to point the ray out from the camera
+                    );
+
+
+
+                    var brightnessSum = vec3f(0.0);
+                    var finalPixelColor = vec3f(0.0);
+                    var raysPerPixel = 1u;
+                    var rayBounces = 4u;
+                    var state = 0.0;
+
+                    for(var rpx = 0u; rpx < raysPerPixel; rpx++) {
+
+                        var rayColor = vec3f(1.0);
+                        var brightness = vec3f(0.0);
+                        var rayOrigin = vec3f(camera.camPos.xyz);
+                        var rayDir = rayDirection;
+
+                        for(var ipb = 0u; ipb < rayBounces; ipb++) {
+                            var ray : Ray = Ray(                                                            // Declare a ray struct to store origin and direction
+                                rayOrigin,                                                                  // ray origin
+                                vec3f(rayDir),                                                              // ray direction
+                                vec3f(1.0, 1.0, 1.0),                                                       // ray color
+                                0u,                                                                         // steps taken
+                                false                                                                       // did hit something                    
+                            );
+
+                            var closestHitInfo : HitInfo = HitInfo(         
+                                false,                                                                      // didHit               
+                                1e30,                                                                       // distance
+                                vec3f(0.0),                                                                 // hitpoint
+                                vec3f(0.0),                                                                 // normal
+                                vec3f(0.0),                                                                 // color
+                                0.0,                                                                        // emissionStrength
+                                0.0,                                                                        // mirrorStrength
+                                0.0                                                                         // mirrorFade
+                            );
+
+                            for(var n : u32 = 0u; n < meshObjectslength; n += 14u) {
+                                let hitboxMin = vec3f(meshObjects[n + 0], meshObjects[n + 1], meshObjects[n + 2]);              // corner on -1, -1 of mesh
+                                let hitboxMax = vec3f(meshObjects[n + 3], meshObjects[n + 4], meshObjects[n + 5]);              // corner on 1, 1 of mesh
+
+                                if RayAABBIntersect(ray, hitboxMin, hitboxMax) { 
+                                    for(var i: u32 = u32(meshObjects[n+6]); i < u32(meshObjects[n+7]); i += 9u) {           
+
+                                        let hitInfo = RayTriangleIntersect(                                                     // test intersection
+                                            ray,
+                                            vec3f(meshVertices[i + 0], meshVertices[i + 1], meshVertices[i + 2]),
+                                            vec3f(meshVertices[i + 3], meshVertices[i + 4], meshVertices[i + 5]),
+                                            vec3f(meshVertices[i + 6], meshVertices[i + 7], meshVertices[i + 8]),
+                                            vec3f(meshObjects[n + 8], meshObjects[n + 9], meshObjects[n + 10]),
+                                            meshObjects[n + 11],
+                                            meshObjects[n + 12],
+                                            meshObjects[n + 13]
+                                        );
+
+                                        if(hitInfo.didHit && closestHitInfo.didHit) {                                           // set closestHitInfo to the closest hit
+                                            if(hitInfo.distance < closestHitInfo.distance) {
+                                                closestHitInfo = hitInfo;
+                                            };
+                                        }else if(hitInfo.didHit) {
+                                            closestHitInfo = hitInfo;
+                                        };
+                                    };
+                                };
+                            };
+
+
+                            // https://youtu.be/Qz0KTGYJtUk?si=NIelFnpAxqFZKysX 22:02 min.
+
+                            if(closestHitInfo.didHit) {
+                                ray.color *= mix(closestHitInfo.color, vec3f(1.0), closestHitInfo.mirrorStrength);
+                                rayOrigin = closestHitInfo.hitpoint;
+
+                                brightness += closestHitInfo.color * closestHitInfo.emissionStrength * rayColor;
+
+                                let rd = (ndc.x + ndc.y * (ndc.x + rdval)) * (rdval + ndc.y);                                                                                       // making a somewhat random value
+                                let rdVec = cosineHemisphere(closestHitInfo.normal, rd + state);                                                                                    // making the semi random vector
+                                state += rd;
+
+                                rayDir = mix(rdVec, normalize(ray.dir - 2.0 * dot(ray.dir, closestHitInfo.normal) * closestHitInfo.normal), closestHitInfo.mirrorStrength);
+                                rayColor *= mix(closestHitInfo.color, vec3f(1.0), closestHitInfo.mirrorStrength);
+                                rayColor *= mix(vec3f(1.0), vec3f(0.0), mix(0.0, closestHitInfo.mirrorFade, closestHitInfo.mirrorStrength));
+
+                                if(closestHitInfo.emissionStrength > 1.0) {
+                                    //if(ipb == 0) {brightness = vec3f(0.53, 0.81, 0.92);}          // makes light not show as object. Dosent make it transparent
+                                    break;
+                                };
+                            }else {
+                                brightness += rayColor * vec3f(0.53, 0.81, 0.92);
+                                break;
+                            };
+                        };
+
+                        brightnessSum += brightness;
+                    };
+
+                    finalPixelColor = brightnessSum / f32(raysPerPixel);
+
+
+                    // CHATGPT for texture accumulation
+
+                    let prev = textureLoad(accumRead, vec2<i32>(pos.xy), 0).rgb;
+                    let fi = f32(frameIndex);
+                    let accumulated = (prev * fi + finalPixelColor) / (fi + 1.0);
+
+                    textureStore(
+                        accumWrite,
+                        vec2<i32>(pos.xy),
+                        vec4f(accumulated, 1.0)
+                    );
+                }
+            `;
+                            
+
+            function createAccumTexture() {
+                return device.createTexture({
+                    size: [canvas.width, canvas.height],
+                    format: "rgba32float",
+                    usage:
+                        GPUTextureUsage.STORAGE_BINDING |
+                        GPUTextureUsage.TEXTURE_BINDING |
+                        GPUTextureUsage.COPY_SRC
+                });
+            };
+            let accumTexA = createAccumTexture();
+            let accumTexB = createAccumTexture();
+            let readTex  = accumTexA;
+            let writeTex = accumTexB;
+
+            const frameIndexBuffer = device.createBuffer({
+                size: 4,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+
+            const cameraBuffer = device.createBuffer({
+                size: 48,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+            device.queue.writeBuffer(cameraBuffer, 0, packCameraData(camera));
+
+            const resolutionBuffer = device.createBuffer({
+                size: 8,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+            device.queue.writeBuffer(resolutionBuffer, 0, new Float32Array([canvas.width, canvas.height]));
+
+            const timeBuffer = device.createBuffer({
+                size: 4,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+            device.queue.writeBuffer(timeBuffer, 0, new Float32Array([rdval]));
+
+            const vertexBuffer = device.createBuffer({
+                size: vertices.byteLength,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            });
+            device.queue.writeBuffer(vertexBuffer, 0, vertices);
+
+            const objectBuffer = device.createBuffer({
+                size: objects.byteLength,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            });
+            device.queue.writeBuffer(objectBuffer, 0, objects);
+
+            const objectlengthBuffer = device.createBuffer({
+                size: 4,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+            device.queue.writeBuffer(objectlengthBuffer, 0, new Uint32Array([objects.length]));
+
+
+            const computeModule = device.createShaderModule({ code: computeShaderCode });
+            const computePipeline = device.createComputePipeline({
+                layout: "auto",
+                compute: { module: computeModule, entryPoint: "main" },
+            });
+            function makeComputeBindGroup(readTex, writeTex) {
+                return device.createBindGroup({
+                    layout: computePipeline.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: writeTex.createView() },
+                        { binding: 1, resource: readTex.createView() },
+                        { binding: 2, resource: { buffer: resolutionBuffer } },
+                        { binding: 3, resource: { buffer: cameraBuffer } },
+                        { binding: 4, resource: { buffer: frameIndexBuffer } },
+                        { binding: 5, resource: { buffer: timeBuffer } },
+                        { binding: 6, resource: { buffer: vertexBuffer } },
+                        { binding: 7, resource: { buffer: objectBuffer } },
+                        { binding: 8, resource: { buffer: objectlengthBuffer } }
+                    ],
+                });
+            };
+            
+
+            ////////////////////////////////////////////////////////////////////////////////////////////////////////////
+            // help from CHATGPT until line 756
+            // displays the texture the raytracer writes to on screen
+            ////////////////////////////////////////////////////////////////////////////////////////////////////////////
+            
+            // Render pipeline to draw texture to screen
+            const renderShaderCode = `
+                @group(0) @binding(0) var myTexture : texture_2d<f32>;
+
+                struct VertexOutput {
+                    @builtin(position) position : vec4<f32>,
+                    @location(0) uv : vec2<f32>
+                };
+
+                @vertex
+                fn vs(@builtin(vertex_index) VertexIndex : u32) -> VertexOutput {
+                    var pos = array<vec2<f32>, 6>(
+                        vec2<f32>(-1.0, -1.0),
+                        vec2<f32>(1.0, -1.0),
+                        vec2<f32>(-1.0, 1.0),
+                        vec2<f32>(-1.0, 1.0),
+                        vec2<f32>(1.0, -1.0),
+                        vec2<f32>(1.0, 1.0)
+                    );
+
+                    var uvArr = array<vec2<f32>, 6>(
+                        vec2<f32>(0.0, 1.0),
+                        vec2<f32>(1.0, 1.0),
+                        vec2<f32>(0.0, 0.0),
+                        vec2<f32>(0.0, 0.0),
+                        vec2<f32>(1.0, 1.0),
+                        vec2<f32>(1.0, 0.0)
+                    );
+
+                    var output : VertexOutput;
+                    output.position = vec4<f32>(pos[VertexIndex], 0.0, 1.0);
+                    output.uv = uvArr[VertexIndex];
+                    return output;
+                }
+
+                fn linearToSRGB(c: vec3f) -> vec3f {
+                    return select(
+                        c * 12.92,
+                        1.055 * pow(c, vec3f(1.0 / 2.4)) - 0.055,
+                        c > vec3f(0.0031308)
+                    );
+                };
+
+                @fragment
+                fn fs(input : VertexOutput) -> @location(0) vec4<f32> {
+                    let dims = textureDimensions(myTexture);
+                    let coord = vec2<i32>(input.uv * vec2f(dims));
+                        
+                    let c = textureLoad(myTexture, coord, 0).rgb;
+                    return vec4f(linearToSRGB(c), 1.0);
+                }
+            `;
+
+            const shaderModule = device.createShaderModule({ code: renderShaderCode });
+            const sampler = device.createSampler({ magFilter: "linear", minFilter: "linear" });
+
+            const renderPipeline = device.createRenderPipeline({
+                layout: "auto",
+                vertex: { module: shaderModule, entryPoint: "vs" },
+                fragment: { module: shaderModule, entryPoint: "fs", targets: [{ format }] },
+                primitive: { topology: "triangle-list" },
+            });
+
+            let renderBindGroup = device.createBindGroup({
+                layout: renderPipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: readTex.createView() }
+                ],
+            });
+
+            
+
+            let frames = 0;
+            let lastFrameTime = performance.now();
+            let fpsUpdateTime = lastFrameTime;
+            let fps = 0;
+            let frameIndex = 0;
+            let rendererRunning = false;
+            function frame() {
+
+                rendererRunning = true;
+
+                if(frameIndex > maximumAccumulation) {
+                    rendererRunning = false;
+                };
+
+                frames++;
+                const now = performance.now();
+                if(now - fpsUpdateTime >= 1000) { // update once per second
+                    fps = frames;
+                    frames = 0;
+                    fpsUpdateTime = now;
+                    document.getElementById("fps").innerHTML = `FPS: ${fps}`;
+                }
+                lastFrameTime = now;
+
+                movement();
+
+                device.queue.writeBuffer(cameraBuffer, 0, packCameraData(camera));
+                rdval = Math.random() + 1;
+                device.queue.writeBuffer(timeBuffer, 0, new Float32Array([rdval]));
+
+
+                // help from CHATGPT until line 842
+                // makes all the shader code work in the browser
+
+                // Run compute shader
+                const commandEncoder = device.createCommandEncoder();
+                device.queue.writeBuffer(
+                    frameIndexBuffer,
+                    0,
+                    new Uint32Array([frameIndex])
+                );
+
+                const computeBindGroup = makeComputeBindGroup(readTex, writeTex);
+
+                const computePass = commandEncoder.beginComputePass();
+                computePass.setPipeline(computePipeline);
+                computePass.setBindGroup(0, computeBindGroup);
+                computePass.dispatchWorkgroups(Math.ceil(canvas.width / 8), Math.ceil(canvas.height / 8));
+                computePass.end();
+
+                [readTex, writeTex] = [writeTex, readTex];
+
+                renderBindGroup = device.createBindGroup({
+                    layout: renderPipeline.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: readTex.createView() }
+                    ],
+                });
+
+                frameIndex++;
+
+                // Render to screen
+                const textureView = context.getCurrentTexture().createView();
+                const renderPass = commandEncoder.beginRenderPass({
+                    colorAttachments: [{
+                        view: textureView,
+                        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                        loadOp: "clear",
+                        storeOp: "store"
+                    }]
+                });
+
+                renderPass.setPipeline(renderPipeline);
+                renderPass.setBindGroup(0, renderBindGroup);
+                renderPass.draw(6);
+                renderPass.end();
+
+                device.queue.submit([commandEncoder.finish()]);
+
+                if(rendererRunning) setTimeout(frame, minFrameTime);
+            };
+
+
+
+            function constantLoop() {
+                if(!rendererRunning) movement();
+                if(!rendererRunning && frameIndex == 0) frame();
+                requestAnimationFrame(constantLoop);
+            };
+            constantLoop();
+            
+            
+        }, 500);
+    };
+init();
+</script>
+</body>
+</html>
